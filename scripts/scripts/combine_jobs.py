@@ -1,6 +1,6 @@
 import csv
 
-INPUTS = ["workday_jobs.csv", "greenhouse_jobs.csv"]
+INPUTS = ["workday_jobs.csv", "greenhouse_jobs.csv", "lever_jobs.csv"]
 OUT    = "combined_jobs.csv"
 
 def read_rows(path):
