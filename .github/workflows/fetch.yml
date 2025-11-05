@@ -6,14 +6,16 @@ on:
 jobs:
   fetch:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
@@ -27,7 +29,7 @@ jobs:
           python scripts/fetch_workday_jobs.py
 
       - name: Upload output CSV
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4   # <-- updated to v4
         with:
           name: workday_jobs
           path: workday_jobs.csv
