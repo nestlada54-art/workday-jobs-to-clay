@@ -1,117 +1,119 @@
-import csv
-import os
+import os, csv, re, sys, time
+from datetime import datetime, timedelta, timezone
 import requests
-from datetime import datetime
 
-# Load your RapidAPI key from the GitHub secret
+# --- CONFIG ---
 RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
-
-# Workday Jobs API endpoint
-WORKDAY_API_URL = "https://workday-jobs-api.p.rapidapi.com/active-ats-24h"
+# Use the broader endpoint (not 24h-limited)
+API_URL = "https://workday-jobs-api.p.rapidapi.com/jobs"
 
 HEADERS = {
     "x-rapidapi-host": "workday-jobs-api.p.rapidapi.com",
-    "x-rapidapi-key": RAPIDAPI_KEY
+    "x-rapidapi-key": RAPIDAPI_KEY or ""
 }
 
-# Target keywords for filtering roles (Accounting, Finance, IT, Marketing, Product Management - Manager+)
-TARGET_KEYWORDS = [
-    "accounting", "finance", "financial", "it", "information technology",
-    "marketing", "product management", "product manager", "product director",
-    "manager", "director", "lead", "head", "vp", "chief"
+# Ask for a 14-day lookback (the API will ignore unknown params gracefully)
+LOOKBACK_DAYS = 14
+LOCATION_FILTER = '"United States"'
+
+# Seniority probes to increase recall from the API
+TITLE_FILTERS = [
+    '"manager"', '"senior manager"', '"director"', '"head"', '"lead"', '"vp"', '"vice president"'
 ]
 
-EXCLUDE_KEYWORDS = [
-    "recruiter", "talent acquisition", "sourcer", "hr intern", "human resources intern"
-]
+# Functional focus
+FUNCTION_RE   = re.compile(r"(accounting|finance|financial|it|information\s*technology|marketing|product)", re.I)
+SENIORITY_RE  = re.compile(r"(manager|lead|head|director|vp|vice\s*president|sr\.|senior)", re.I)
+EXCLUDE_RE    = re.compile(r"(recruiter|talent\s*acquisition|sourcer)", re.I)
+US_RE         = re.compile(r"(United States|USA)", re.I)
 
-def load_companies(filename="companies.csv"):
-    companies = []
-    with open(filename, newline='', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            companies.append({
-                "company": row.get("company", "").strip(),
-                "domain": row.get("domain", "").strip()
-            })
-    return companies
+OUT_CSV = "workday_jobs.csv"
+COMPANY_CSV = "companies.csv"
 
+def read_company_whitelist():
+    names, domains = set(), set()
+    if not os.path.exists(COMPANY_CSV):
+        return names, domains
+    with open(COMPANY_CSV, newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            c = (row.get("company") or "").strip().lower()
+            d = (row.get("domain") or "").strip().lower()
+            if c: names.add(c)
+            if d: domains.add(d)
+    return names, domains
 
-def fetch_jobs_for_company(company_name):
-    """Fetch jobs from Workday API for a specific company."""
+def company_matches(company, url, names, domains):
+    c = (company or "").strip().lower()
+    u = (url or "").strip().lower()
+    if not names and not domains:
+        return True
+    return (c in names) or any(d and d in u for d in domains)
+
+def fetch_batch(title_filter):
     params = {
-        "title_filter": "",  # We'll filter later
-        "location_filter": "United States"
+        "title_filter": title_filter,
+        "location_filter": LOCATION_FILTER,
+        # common patterns some RapidAPI “jobs” endpoints accept:
+        "days": str(LOOKBACK_DAYS),          # preferred if supported
+        "posted_within_days": str(LOOKBACK_DAYS)  # fallback if provider uses this name
     }
-
-    try:
-        response = requests.get(WORKDAY_API_URL, headers=HEADERS, params=params)
-        response.raise_for_status()
-        data = response.json()
-        jobs = data.get("jobs", [])
-        company_jobs = []
-
-        for job in jobs:
-            title = job.get("title", "").lower()
-            location = job.get("location", "")
-            url = job.get("url", "")
-            company = job.get("company", "")
-
-            # Only include US jobs with matching company name or domain in URL
-            if (
-                "united states" in location.lower()
-                and (company_name.lower() in company.lower() or company_name.lower().replace(" ", "") in url.lower())
-            ):
-                company_jobs.append(job)
-
-        return company_jobs
-
-    except Exception as e:
-        print(f"Error fetching for {company_name}: {e}")
-        return []
-
-
-def filter_jobs(jobs):
-    """Filter jobs by target titles and exclude unwanted ones."""
-    filtered = []
-    for job in jobs:
-        title = job.get("title", "").lower()
-        url = job.get("url", "")
-        company = job.get("company", "")
-        location = job.get("location", "")
-
-        if any(word in title for word in TARGET_KEYWORDS) and not any(bad in title for bad in EXCLUDE_KEYWORDS):
-            filtered.append({
-                "company": company,
-                "title": job.get("title", ""),
-                "location": location,
-                "url": url
-            })
-    return filtered
-
+    resp = requests.get(API_URL, headers=HEADERS, params=params, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
+    # Guard for provider naming
+    return data.get("results") or data.get("jobs") or []
 
 def main():
-    companies = load_companies()
-    all_jobs = []
+    if not RAPIDAPI_KEY:
+        print("❌ Missing RAPIDAPI_KEY (Repo → Settings → Secrets → Actions).", file=sys.stderr)
+        sys.exit(1)
 
-    print(f"Fetching jobs for {len(companies)} companies...")
+    names, domains = read_company_whitelist()
+    out_rows, seen = [], set()
 
-    for company in companies:
-        name = company["company"]
-        print(f"→ Fetching jobs for {name}...")
-        jobs = fetch_jobs_for_company(name)
-        filtered = filter_jobs(jobs)
-        all_jobs.extend(filtered)
+    for t in TITLE_FILTERS:
+        try:
+            print(f"Fetching with title_filter={t} over last {LOOKBACK_DAYS} days…")
+            results = fetch_batch(t)
+        except requests.HTTPError as e:
+            print(f"HTTP error: {e} body={(e.response and e.response.text) or ''}", file=sys.stderr)
+            time.sleep(2)
+            continue
+        except Exception as e:
+            print(f"Fetch error: {e}", file=sys.stderr)
+            time.sleep(2)
+            continue
 
-    # Save to CSV
-    output_file = "workday_jobs.csv"
-    with open(output_file, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["company", "title", "location", "url"])
-        writer.writeheader()
-        writer.writerows(all_jobs)
+        for j in results:
+            company  = (j.get("company") or "").strip()
+            title    = (j.get("title") or "").strip()
+            location = (j.get("location") or "").strip()
+            url      = (j.get("url") or j.get("job_url") or j.get("source_url") or "").strip()
+            posted   = (j.get("posted_date") or j.get("date") or "").strip()
 
-    print(f"✅ Done. Saved {len(all_jobs)} filtered jobs to {output_file}")
+            key = (company.lower(), title.lower(), url.lower())
+            if key in seen:
+                continue
 
+            if not company_matches(company, url, names, domains):
+                continue
+            if not FUNCTION_RE.search(title): continue
+            if not SENIORITY_RE.search(title): continue
+            if EXCLUDE_RE.search(title): continue
+            if not US_RE.search(location): continue
+
+            seen.add(key)
+            out_rows.append([company, title, location, posted, url, "Workday"])
+
+        time.sleep(1)
+
+    with open(OUT_CSV, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["company","title","location","posted_date","job_url","source"])
+        w.writerows(out_rows)
+
+    print(f"✅ Wrote {len(out_rows)} rows to {OUT_CSV}")
 
 if __name__ == "__main__":
     main()
